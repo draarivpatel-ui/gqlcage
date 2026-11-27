@@ -165,6 +165,7 @@ Without schema knowledge, no static analyzer can know list cardinality or resolv
 
 - one point per expanded field,
 - one point per argument,
+- one point per nested input object field or list item inside argument literals,
 - one point per directive,
 - one point per expanded fragment spread.
 

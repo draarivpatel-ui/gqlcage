@@ -94,6 +94,7 @@ export interface GqlCagePolicyOptions {
   maxVariablesDepth?: number;
   maxVariablesNodes?: number;
   maxFindings?: number;
+  /** Maximum static complexity estimate (expanded fields, arguments, nested input object fields and list items in argument literals, directives, and expanded fragment spreads). */
   maxComplexity?: number;
 }
 
@@ -123,6 +124,7 @@ export interface GqlCageMetrics {
   tokens: number;
   operations: number;
   fragments: number;
+  /** Static complexity estimate: 1 per expanded field, argument, nested input object field or list item in argument literals, directive, and expanded fragment spread. */
   complexity: number;
   arguments: number;
   variables: number;

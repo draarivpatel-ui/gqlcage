@@ -241,3 +241,54 @@ test('policy presets object is frozen', () => {
   assert.equal(Object.isFrozen(GQLCAGE_POLICY_PRESETS), true);
   assert.equal(Object.isFrozen(GQLCAGE_POLICY_PRESETS.public), true);
 });
+
+test('nested input literal object fields and list items increase complexity at same argument count', () => {
+  const narrow = auditGraphQL('{ a(v: 1) }');
+  const emptyList = auditGraphQL('{ a(v: []) }');
+  const emptyObject = auditGraphQL('{ a(v: {}) }');
+  const wideList = auditGraphQL('{ a(v: [1, 2, 3, 4, 5]) }');
+  const wideObject = auditGraphQL('{ a(v: { a: 1, b: [2, 3], c: { d: 4 } }) }');
+
+  assert.equal(narrow.metrics.arguments, 1);
+  assert.equal(wideList.metrics.arguments, 1);
+  assert.equal(wideObject.metrics.arguments, 1);
+
+  assert.equal(narrow.metrics.complexity, 2);
+  assert.equal(emptyList.metrics.complexity, 2);
+  assert.equal(emptyObject.metrics.complexity, 2);
+  assert.equal(wideList.metrics.complexity, 7);
+  assert.equal(wideObject.metrics.complexity, 8);
+  assert.equal(wideList.metrics.complexity > narrow.metrics.complexity, true);
+  assert.equal(wideObject.metrics.complexity > narrow.metrics.complexity, true);
+});
+
+test('directive argument nested input literals contribute to complexity', () => {
+  const report = auditGraphQL('{ a @d(filter: { x: [1, 2] }) }');
+  assert.equal(report.metrics.directives, 1);
+  assert.equal(report.metrics.arguments, 1);
+  assert.equal(report.metrics.complexity, 6);
+});
+
+test('variable references and defaults do not double-count complexity', () => {
+  const withDefault = auditGraphQL('query Q($x: Input = { a: 1, b: [2, 3] }) { a(v: $x) }');
+  assert.equal(withDefault.metrics.arguments, 1);
+  assert.equal(withDefault.metrics.variables, 1);
+  assert.equal(withDefault.metrics.complexity, 2);
+});
+
+test('maxComplexity rejects wide input literal while allowing narrow literal at same argument count', () => {
+  const narrow = auditGraphQL('{ a(v: 1) }', { maxComplexity: 3 });
+  const wide = auditGraphQL('{ a(v: { x: 1, y: 2, z: 3 }) }', { maxComplexity: 3 });
+  assert.equal(narrow.safe, true);
+  assert.equal(wide.safe, false);
+  assert.equal(hasFinding(wide, 'GQLCAGE_COMPLEXITY_EXCEEDED'), true);
+});
+
+test('deeply nested input literal complexity is computed iteratively', () => {
+  const depth = 2000;
+  const query = `{ a(v: ${'['.repeat(depth)}${']'.repeat(depth)}) }`;
+  const report = auditGraphQL(query, { maxInputDepth: depth + 1, maxTokens: depth * 3, maxBytes: depth * 4 });
+  assert.equal(report.safe, true);
+  assert.equal(report.metrics.inputDepth, depth);
+  assert.equal(report.metrics.complexity, 2 + (depth - 1));
+});

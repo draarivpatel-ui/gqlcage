@@ -66,6 +66,7 @@ function inspectValue(root) {
   const result = {
     inputDepth: 0,
     maxStringLength: 0,
+    nestedNodes: 0,
     violations: []
   };
   if (!root) return result;
@@ -80,6 +81,7 @@ function inspectValue(root) {
     if (node.kind === 'list') {
       const depth = item.containerDepth + 1;
       if (depth > result.inputDepth) result.inputDepth = depth;
+      result.nestedNodes = satAdd(result.nestedNodes, node.values.length);
       for (let index = node.values.length - 1; index >= 0; index -= 1) {
         stack.push({ node: node.values[index], containerDepth: depth });
       }
@@ -88,6 +90,7 @@ function inspectValue(root) {
     if (node.kind === 'object') {
       const depth = item.containerDepth + 1;
       if (depth > result.inputDepth) result.inputDepth = depth;
+      result.nestedNodes = satAdd(result.nestedNodes, node.fields.length);
       const seen = new Set();
       for (const field of node.fields) {
         if (DANGEROUS_NAMES.has(field.name)) {
@@ -109,11 +112,13 @@ function inspectValue(root) {
 function measureArguments(args) {
   const result = {
     count: args.length,
+    complexity: args.length,
     inputDepth: 0,
     maxStringLength: 0
   };
   for (const arg of args) {
     const value = inspectValue(arg.value);
+    result.complexity = satAdd(result.complexity, value.nestedNodes);
     if (value.inputDepth > result.inputDepth) result.inputDepth = value.inputDepth;
     if (value.maxStringLength > result.maxStringLength) result.maxStringLength = value.maxStringLength;
   }
@@ -124,12 +129,14 @@ function measureDirectives(directives) {
   const result = {
     count: directives.length,
     arguments: 0,
+    complexity: directives.length,
     inputDepth: 0,
     maxStringLength: 0
   };
   for (const directive of directives) {
     const args = measureArguments(directive.arguments);
     result.arguments = satAdd(result.arguments, args.count);
+    result.complexity = satAdd(result.complexity, args.complexity);
     if (args.inputDepth > result.inputDepth) result.inputDepth = args.inputDepth;
     if (args.maxStringLength > result.maxStringLength) result.maxStringLength = args.maxStringLength;
   }
@@ -197,7 +204,7 @@ function applyDirectiveMetrics(target, directives) {
   const measured = measureDirectives(directives);
   target.directives = satAdd(target.directives, measured.count);
   target.arguments = satAdd(target.arguments, measured.arguments);
-  target.complexity = satAdd(target.complexity, satAdd(measured.count, measured.arguments));
+  target.complexity = satAdd(target.complexity, measured.complexity);
   if (directives.length > target.maxDirectivesPerLocation) target.maxDirectivesPerLocation = directives.length;
   if (measured.inputDepth > target.inputDepth) target.inputDepth = measured.inputDepth;
   if (measured.maxStringLength > target.maxStringLength) target.maxStringLength = measured.maxStringLength;
@@ -237,7 +244,7 @@ function summarizeSelectionSet(rootSet, fragmentSummaries, limits) {
         summary.arguments = satAdd(summary.arguments, argMetrics.count);
         applyValueMetrics(summary, argMetrics);
         applyDirectiveMetrics(summary, selection.directives);
-        summary.complexity = satAdd(summary.complexity, satAdd(1, selection.arguments.length));
+        summary.complexity = satAdd(summary.complexity, satAdd(1, argMetrics.complexity));
         summary.depth = Math.max(summary.depth, 1);
         if (selection.selectionSet) {
           const child = summaries.get(selection.selectionSet);
