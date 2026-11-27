@@ -33,7 +33,6 @@ const PUBLIC_EXPORTS = [
   'createGraphQLGuard'
 ];
 
-const IMPORT_PATTERN = /^import\s*\{([^}]+)\}\s*from\s*['"](\.\/[A-Za-z0-9_-]+\.mjs)['"];\s*$/gm;
 const EXPORT_LIST_PATTERN = /^export\s*\{([^}]+)\};\s*$/gm;
 const EXPORT_DEFAULT_PATTERN = /^export\s+default\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*;\s*$/gm;
 const EXPORT_DECLARATION_PATTERN = /^export\s+(?=(?:async\s+function|function|class|const)\b)/gm;
@@ -64,22 +63,9 @@ function parseExportClause(clause) {
   });
 }
 
-function analyzeModule(name, source) {
-  const imports = [];
-  let match;
-  IMPORT_PATTERN.lastIndex = 0;
-  while ((match = IMPORT_PATTERN.exec(source)) !== null) {
-    imports.push({
-      specifier: match[1],
-      entries: parseImportClause(match[2] ? match[1] : match[1])
-    });
-  }
-  return { name, source, imports };
-}
-
 function readImports(source) {
   const imports = [];
-  const pattern = /^import\s*\{([^}]+)\}\s*from\s*['"](\.\/[A-Za-z0-9_-]+\.mjs)['"];\s*$/gm;
+  const pattern = /^import\s*\{([^}]+)\}\s*from\s*['"]((?:\.\/[A-Za-z0-9_-]+\.mjs)|(?:node:[A-Za-z0-9/]+))['"];\s*$/gm;
   let match;
   while ((match = pattern.exec(source)) !== null) {
     imports.push({
@@ -100,6 +86,7 @@ function topoSort(moduleMap) {
     state.set(name, 1);
     const moduleInfo = moduleMap.get(name);
     for (const item of moduleInfo.imports) {
+      if (!item.specifier.startsWith('./')) continue;
       const dependency = item.specifier.slice(2);
       if (!moduleMap.has(dependency)) throw new Error('missing local ESM dependency ' + item.specifier + ' in ' + name);
       visit(dependency, stack.concat(name));
@@ -117,14 +104,18 @@ function transformModule(name, source, moduleVariables) {
   let body = source;
   const importLines = [];
   for (const item of imports) {
-    const dependency = item.specifier.slice(2);
-    const variable = moduleVariables.get(dependency);
     const parts = item.entries.map((entry) => entry.imported === entry.local
       ? entry.imported
       : entry.imported + ': ' + entry.local);
-    importLines.push('const { ' + parts.join(', ') + ' } = ' + variable + ';');
+    if (item.specifier.startsWith('./')) {
+      const dependency = item.specifier.slice(2);
+      const variable = moduleVariables.get(dependency);
+      importLines.push('const { ' + parts.join(', ') + ' } = ' + variable + ';');
+    } else {
+      importLines.push('const { ' + parts.join(', ') + ' } = require(' + JSON.stringify(item.specifier) + ');');
+    }
   }
-  body = body.replace(/^import\s*\{[^}]+\}\s*from\s*['"]\.\/[A-Za-z0-9_-]+\.mjs['"];\s*\n?/gm, '');
+  body = body.replace(/^import\s*\{[^}]+\}\s*from\s*['"](?:\.\/[A-Za-z0-9_-]+\.mjs|node:[A-Za-z0-9/]+)['"];\s*\n?/gm, '');
 
   EXPORT_LIST_PATTERN.lastIndex = 0;
   body = body.replace(EXPORT_LIST_PATTERN, (whole, clause) => {

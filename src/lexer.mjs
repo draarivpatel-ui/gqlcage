@@ -12,6 +12,7 @@ function isDisallowedControl(code) {
     || code === 0x000c
     || (code >= 0x000e && code <= 0x001f)
     || (code >= 0x007f && code <= 0x009f)
+    || code === 0x061c
     || code === 0x200e
     || code === 0x200f
     || (code >= 0x202a && code <= 0x202e)
@@ -107,7 +108,7 @@ export function lexGraphQL(source, options = {}) {
   const skipWhitespaceAndComments = () => {
     while (index < source.length) {
       const code = source.charCodeAt(index);
-      if (code === 0x0020 || code === 0x0009 || code === 0x000a || code === 0x000d || code === 0x002c) {
+      if (code === 0x0020 || code === 0x0009 || code === 0x000a || code === 0x000d || code === 0x002c || code === 0xfeff) {
         advanceOne();
         continue;
       }

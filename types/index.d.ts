@@ -131,7 +131,7 @@ export interface GqlCageMetrics {
   duplicateFields: number;
   inputDepth: number;
   maxStringLength: number;
-  maxDirectivesPerLocation?: number;
+  maxDirectivesPerLocation: number;
 }
 
 export interface GqlCageStats {

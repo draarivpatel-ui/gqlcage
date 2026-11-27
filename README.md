@@ -13,7 +13,7 @@ Zero-dependency GraphQL query security firewall, iterative parser, and denial of
 - Effective depth, expanded field, alias, duplicate field, directive, argument, variable, input nesting, string length, root field, operation count, and complexity limits.
 - Introspection is blocked by default. `__typename` has a separate policy switch.
 - Operation type allow lists and executable-document-only parsing. SDL such as `type`, `schema`, and `extend` is rejected.
-- HTTP JSON request auditing with batch blocking, byte limits, variables depth and size limits, prototype pollution key detection, and an Express-style middleware helper.
+- HTTP JSON request auditing with batch blocking, byte limits, variables depth and size limits, strict JSON data checks, prototype pollution key detection, and an Express-style middleware helper.
 - Dual ESM and CommonJS entry points, TypeScript declarations, and a CLI.
 - Node.js 18 or newer.
 
@@ -75,6 +75,8 @@ const guard = createGraphQLGuard({ preset: 'public' });
 `createGraphQLGuard` expects a parsed JSON body on `req.body`. It writes a 400 JSON response for unsafe requests and attaches the full report to `req.gqlcage`.
 
 Array batching is blocked by default because `maxBatchSize` is `1` in the public preset. Raise it only when batching is intentionally supported.
+
+Variables and extensions must be strict JSON data when passed as JavaScript objects. Proxy objects, accessors, sparse arrays, symbol keys, non-finite numbers, and reference cycles are rejected fail closed. Keys named `__proto__`, `constructor`, `prototype`, `toString`, or `valueOf` are rejected in executable input objects and JSON data because they are common object injection and prototype pollution primitives.
 
 ## CLI
 
