@@ -28,7 +28,10 @@ Aliases, repeated response keys, repeated underlying fields, root fields, operat
 
 ### HTTP batching and variables bombs
 
-JSON array batching is denied by default. Variables and extensions are inspected iteratively for depth, node count, estimated encoded bytes, non-JSON values, reference cycles, and prototype pollution keys.
+JSON values are treated as strict data rather than arbitrary JavaScript objects. Proxy objects and accessor properties are rejected without invoking user-controlled traps or getters. Sparse arrays, symbol-keyed properties, and non-finite numbers are also rejected.
+
+
+JSON array batching is denied by default. Variables and extensions are inspected iteratively for depth, node count, estimated encoded bytes, non-JSON values, reference cycles, Proxy objects, accessor properties, sparse arrays, symbol keys, and prototype pollution or object injection keys.
 
 ## Residual risk
 

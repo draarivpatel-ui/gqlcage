@@ -3,7 +3,7 @@ import { parseGraphQLDocument } from './parser.mjs';
 import { createGraphQLPolicy } from './policy.mjs';
 
 const LIMIT = Number.MAX_SAFE_INTEGER;
-const DANGEROUS_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
+const DANGEROUS_NAMES = new Set(['__proto__', 'constructor', 'prototype', 'toString', 'valueOf']);
 
 function satAdd(left, right) {
   if (left >= LIMIT || right >= LIMIT) return LIMIT;
@@ -484,6 +484,14 @@ function scanStaticDocument(document, policy, sink) {
   }
 
   for (const fragment of fragments) {
+    if (DANGEROUS_NAMES.has(fragment.name)) {
+      sink.add(makeFinding(GQLCAGE_ERROR_CODES.PROTOTYPE_POLLUTION, 'fragment name is a prototype pollution primitive', {
+        path: 'fragment.' + fragment.name,
+        line: fragment.loc.line,
+        column: fragment.loc.column,
+        details: { name: fragment.name }
+      }));
+    }
     if (fragmentNames.has(fragment.name)) {
       sink.add(makeFinding(GQLCAGE_ERROR_CODES.DUPLICATE_FRAGMENT, 'fragment names must be unique', {
         path: 'fragment.' + fragment.name,
@@ -552,7 +560,8 @@ function emptyMetrics() {
     rootFields: 0,
     duplicateFields: 0,
     inputDepth: 0,
-    maxStringLength: 0
+    maxStringLength: 0,
+    maxDirectivesPerLocation: 0
   };
 }
 

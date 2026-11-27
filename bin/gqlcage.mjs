@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-import { readFileSync } from 'node:fs';
-import { auditGraphQL } from '../src/index.mjs';
+import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
+import { GQLCAGE_ERROR_CODES, auditGraphQL, createGraphQLPolicy } from '../src/index.mjs';
 
 function isNeutralizedCode(code) {
   return code < 32
     || (code >= 127 && code <= 159)
+    || code === 1564
     || code === 8206
     || code === 8207
     || (code >= 8234 && code <= 8238)
@@ -62,7 +63,7 @@ if (argv.includes('--help')) {
 const command = argv[0];
 if (!['audit', 'validate', 'metrics'].includes(command)) failUsage('missing or unknown command');
 let inputPath = null;
-const policy = {};
+const policyOptions = {};
 let json = false;
 
 for (let index = 1; index < argv.length; index += 1) {
@@ -72,11 +73,11 @@ for (let index = 1; index < argv.length; index += 1) {
     continue;
   }
   if (arg === '--allow-introspection') {
-    policy.allowIntrospection = true;
+    policyOptions.allowIntrospection = true;
     continue;
   }
   if (arg === '--allow-typename') {
-    policy.allowTypename = true;
+    policyOptions.allowTypename = true;
     continue;
   }
   if (arg === '--preset' || arg === '--max-depth' || arg === '--max-aliases' || arg === '--max-tokens' || arg === '--max-bytes' || arg === '--max-complexity') {
@@ -85,7 +86,7 @@ for (let index = 1; index < argv.length; index += 1) {
     index += 1;
     if (arg === '--preset') {
       if (!['strict', 'public', 'internal'].includes(value)) failUsage('unknown preset ' + value);
-      policy.preset = value;
+      policyOptions.preset = value;
     } else {
       const key = {
         '--max-depth': 'maxDepth',
@@ -94,7 +95,7 @@ for (let index = 1; index < argv.length; index += 1) {
         '--max-bytes': 'maxBytes',
         '--max-complexity': 'maxComplexity'
       }[arg];
-      policy[key] = parseInteger(value, arg);
+      policyOptions[key] = parseInteger(value, arg);
     }
     continue;
   }
@@ -105,9 +106,113 @@ for (let index = 1; index < argv.length; index += 1) {
 
 if (inputPath === null) failUsage('missing input file or - for stdin');
 
-let query;
+let policy;
 try {
-  query = inputPath === '-' ? readFileSync(0, 'utf8') : readFileSync(inputPath, 'utf8');
+  policy = createGraphQLPolicy(policyOptions);
+} catch (error) {
+  failUsage('invalid policy: ' + error.message);
+}
+
+function readBoundedDescriptor(fd, limit) {
+  const chunkLength = Math.max(1, Math.min(64 * 1024, limit + 1));
+  const buffer = Buffer.allocUnsafe(chunkLength);
+  const chunks = [];
+  let total = 0;
+  while (total <= limit) {
+    const wanted = Math.min(chunkLength, limit + 1 - total);
+    if (wanted <= 0) break;
+    const count = readSync(fd, buffer, 0, wanted, null);
+    if (count === 0) break;
+    total += count;
+    chunks.push(Buffer.from(buffer.subarray(0, count)));
+  }
+  return {
+    text: Buffer.concat(chunks).toString('utf8'),
+    bytes: total,
+    overLimit: total > limit
+  };
+}
+
+async function readStdinBounded(limit) {
+  const chunks = [];
+  let total = 0;
+  let overLimit = false;
+  for await (const chunk of process.stdin) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const remaining = limit + 1 - total;
+    const selected = buffer.length > remaining ? buffer.subarray(0, remaining) : buffer;
+    chunks.push(selected);
+    total += selected.length;
+    if (total > limit) {
+      overLimit = true;
+      break;
+    }
+  }
+  if (overLimit) process.stdin.destroy();
+  return {
+    text: Buffer.concat(chunks).toString('utf8'),
+    bytes: total,
+    overLimit
+  };
+}
+
+function readInputBounded(filePath, limit) {
+  if (filePath === '-') return readStdinBounded(limit);
+  let fd = null;
+  try {
+    fd = openSync(filePath, 'r');
+    const stats = fstatSync(fd);
+    if (stats.isFile() && stats.size > limit) {
+      return { text: '', bytes: stats.size, overLimit: true };
+    }
+    return readBoundedDescriptor(fd, limit);
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function oversizedInputReport(observedBytes, selectedPolicy) {
+  return {
+    safe: false,
+    findings: [{
+      code: GQLCAGE_ERROR_CODES.INPUT_TOO_LARGE,
+      severity: 'error',
+      message: 'GraphQL input exceeds the configured byte limit',
+      line: 1,
+      column: 1,
+      details: { bytes: observedBytes, maxBytes: selectedPolicy.maxBytes }
+    }],
+    metrics: {
+      depth: 0,
+      expandedFields: 0,
+      aliases: 0,
+      directives: 0,
+      tokens: 0,
+      operations: 0,
+      fragments: 0,
+      complexity: 0,
+      arguments: 0,
+      variables: 0,
+      fragmentSpreads: 0,
+      rootFields: 0,
+      duplicateFields: 0,
+      inputDepth: 0,
+      maxStringLength: 0,
+      maxDirectivesPerLocation: 0
+    },
+    stats: {
+      bytes: observedBytes,
+      parseMs: 0,
+      auditMs: 0,
+      findingsTotal: 1,
+      findingsCapped: false
+    }
+  };
+}
+
+let input;
+try {
+  input = await readInputBounded(inputPath, policy.maxBytes);
 } catch (error) {
   process.stderr.write(neutralize('unable to read input: ' + error.message + '\n'));
   process.exit(2);
@@ -115,7 +220,7 @@ try {
 
 let report;
 try {
-  report = auditGraphQL(query, policy);
+  report = input.overLimit ? oversizedInputReport(input.bytes, policy) : auditGraphQL(input.text, policy);
 } catch (error) {
   process.stderr.write(neutralize('gqlcage error: ' + error.message + '\n'));
   process.exit(2);

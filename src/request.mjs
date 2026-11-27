@@ -1,8 +1,9 @@
+import { isProxy } from 'node:util/types';
 import { GQLCAGE_ERROR_CODES, SEVERITY } from './errors.mjs';
 import { auditGraphQL } from './analyzer.mjs';
 import { createGraphQLPolicy } from './policy.mjs';
 
-const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype', 'toString', 'valueOf']);
 const REQUEST_KEYS = new Set(['query', 'operationName', 'variables', 'extensions']);
 
 function makeFinding(code, message, options = {}) {
@@ -45,13 +46,23 @@ function makeSink(maxFindings) {
 }
 
 function isPlainJsonObject(value) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || isProxy(value)) return false;
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
 }
 
 function stringTokenBytes(value) {
   return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+function arrayIndexFromKey(key) {
+  if (!/^(0|[1-9][0-9]*)$/.test(key)) return -1;
+  const index = Number(key);
+  return Number.isSafeInteger(index) && index >= 0 && index < 4294967295 ? index : -1;
+}
+
+function isDataDescriptor(descriptor) {
+  return Boolean(descriptor && Object.hasOwn(descriptor, 'value'));
 }
 
 function inspectJsonValue(root, policy, path) {
@@ -62,11 +73,8 @@ function inspectJsonValue(root, policy, path) {
     violations: []
   };
   const active = new Set();
-  const violationSeen = new Set();
   let terminated = false;
   const addViolation = (violation) => {
-    if (violationSeen.has(violation.code)) return;
-    violationSeen.add(violation.code);
     result.violations.push(violation);
     terminated = true;
   };
@@ -75,21 +83,29 @@ function inspectJsonValue(root, policy, path) {
       addViolation({ code: GQLCAGE_ERROR_CODES.VARIABLES_TOO_LARGE, message: 'JSON value encoded size exceeds policy', path, details: { bytes: result.bytes, limit: policy.maxVariablesBytes } });
     }
   };
+  const addNotJson = (path, message) => {
+    addViolation({ code: GQLCAGE_ERROR_CODES.VARIABLES_NOT_JSON, message, path });
+  };
   const stack = [{ value: root, enclosingDepth: 0, path, entered: false, keys: null, index: 0, containerDepth: 0, isObject: false }];
   while (stack.length > 0 && !terminated) {
     const frame = stack[stack.length - 1];
     if (!frame.entered) {
       frame.entered = true;
       result.nodes += 1;
-      result.bytes += 1;
+      result.bytes = satishAdd(result.bytes, 1);
       if (result.nodes > policy.maxVariablesNodes) {
         addViolation({ code: GQLCAGE_ERROR_CODES.VARIABLES_TOO_LARGE, message: 'JSON value node count exceeds policy', path: frame.path, details: { nodes: result.nodes, limit: policy.maxVariablesNodes } });
         stack.pop();
         continue;
       }
       const value = frame.value;
+      if (isProxy(value)) {
+        addNotJson(frame.path, 'Proxy objects are not valid JSON values');
+        stack.pop();
+        continue;
+      }
       if (value === null) {
-        result.bytes += 3;
+        result.bytes = satishAdd(result.bytes, 3);
         stack.pop();
         continue;
       }
@@ -103,13 +119,13 @@ function inspectJsonValue(root, policy, path) {
         if (!Number.isFinite(value)) {
           addViolation({ code: GQLCAGE_ERROR_CODES.VARIABLES_NOT_JSON, message: 'JSON numbers must be finite', path: frame.path });
         }
-        result.bytes += String(value).length;
+        result.bytes = satishAdd(result.bytes, String(value).length);
         noteBytes(frame.path);
         stack.pop();
         continue;
       }
       if (typeof value === 'boolean') {
-        result.bytes += value ? 4 : 5;
+        result.bytes = satishAdd(result.bytes, value ? 4 : 5);
         stack.pop();
         continue;
       }
@@ -119,6 +135,8 @@ function inspectJsonValue(root, policy, path) {
         if (frame.containerDepth > result.depth) result.depth = frame.containerDepth;
         if (frame.containerDepth > policy.maxVariablesDepth) {
           addViolation({ code: GQLCAGE_ERROR_CODES.VARIABLES_TOO_DEEP, message: 'JSON value nesting depth exceeds policy', path: frame.path, details: { depth: frame.containerDepth, limit: policy.maxVariablesDepth } });
+          stack.pop();
+          continue;
         }
         if (active.has(value)) {
           addViolation({ code: GQLCAGE_ERROR_CODES.VARIABLES_CYCLE, message: 'JSON value contains a reference cycle', path: frame.path });
@@ -126,8 +144,42 @@ function inspectJsonValue(root, policy, path) {
           continue;
         }
         active.add(value);
-        frame.keys = value.map((unused, index) => String(index));
-        result.bytes += 2;
+        const length = value.length;
+        const ownKeys = Object.getOwnPropertyNames(value);
+        const indexKeys = [];
+        let hasInvalidKey = false;
+        let dangerousKey = null;
+        for (const key of ownKeys) {
+          if (key === 'length') continue;
+          const arrayIndex = arrayIndexFromKey(key);
+          if (arrayIndex >= 0 && arrayIndex < length) indexKeys.push(arrayIndex);
+          else hasInvalidKey = true;
+          if (DANGEROUS_KEYS.has(key)) dangerousKey = key;
+        }
+        if (dangerousKey !== null) {
+          addViolation({ code: GQLCAGE_ERROR_CODES.PROTOTYPE_POLLUTION, message: 'JSON object key is a prototype pollution primitive', path: frame.path, details: { key: dangerousKey } });
+          stack.pop();
+          continue;
+        }
+        if (Object.getOwnPropertySymbols(value).length > 0 || hasInvalidKey || indexKeys.length !== length) {
+          addNotJson(frame.path, 'JSON arrays must be dense and contain only array index properties');
+          stack.pop();
+          continue;
+        }
+        let hasAccessor = false;
+        for (const arrayIndex of indexKeys) {
+          if (!isDataDescriptor(Object.getOwnPropertyDescriptor(value, String(arrayIndex)))) {
+            hasAccessor = true;
+            break;
+          }
+        }
+        if (hasAccessor) {
+          addNotJson(frame.path, 'JSON array elements must be data properties');
+          stack.pop();
+          continue;
+        }
+        frame.keys = indexKeys;
+        result.bytes = satishAdd(result.bytes, 2);
         noteBytes(frame.path);
         continue;
       }
@@ -137,6 +189,8 @@ function inspectJsonValue(root, policy, path) {
         if (frame.containerDepth > result.depth) result.depth = frame.containerDepth;
         if (frame.containerDepth > policy.maxVariablesDepth) {
           addViolation({ code: GQLCAGE_ERROR_CODES.VARIABLES_TOO_DEEP, message: 'JSON value nesting depth exceeds policy', path: frame.path, details: { depth: frame.containerDepth, limit: policy.maxVariablesDepth } });
+          stack.pop();
+          continue;
         }
         if (active.has(value)) {
           addViolation({ code: GQLCAGE_ERROR_CODES.VARIABLES_CYCLE, message: 'JSON value contains a reference cycle', path: frame.path });
@@ -144,8 +198,13 @@ function inspectJsonValue(root, policy, path) {
           continue;
         }
         active.add(value);
-        frame.keys = Object.keys(value);
-        result.bytes += 2;
+        if (Object.getOwnPropertySymbols(value).length > 0) {
+          addNotJson(frame.path, 'JSON objects cannot contain symbol-keyed properties');
+          stack.pop();
+          continue;
+        }
+        frame.keys = Object.getOwnPropertyNames(value);
+        result.bytes = satishAdd(result.bytes, 2);
         continue;
       }
       addViolation({ code: GQLCAGE_ERROR_CODES.VARIABLES_NOT_JSON, message: 'value is not representable as strict JSON', path: frame.path });
@@ -159,18 +218,29 @@ function inspectJsonValue(root, policy, path) {
       let child;
       let childPath;
       if (frame.isObject) {
-        result.bytes += stringTokenBytes(key) + 1;
+        result.bytes = satishAdd(result.bytes, stringTokenBytes(key) + 1);
         noteBytes(frame.path);
         if (DANGEROUS_KEYS.has(key)) {
           addViolation({ code: GQLCAGE_ERROR_CODES.PROTOTYPE_POLLUTION, message: 'JSON object key is a prototype pollution primitive', path: frame.path, details: { key } });
+          continue;
         }
-        child = frame.value[key];
+        const descriptor = Object.getOwnPropertyDescriptor(frame.value, key);
+        if (!isDataDescriptor(descriptor)) {
+          addNotJson(frame.path + '.' + key, 'JSON object properties must be data properties');
+          continue;
+        }
+        child = descriptor.value;
         childPath = frame.path + '.' + key;
       } else {
-        child = frame.value[Number(key)];
+        const descriptor = Object.getOwnPropertyDescriptor(frame.value, String(key));
+        if (!isDataDescriptor(descriptor)) {
+          addNotJson(frame.path + '[' + key + ']', 'JSON array elements must be data properties');
+          continue;
+        }
+        child = descriptor.value;
         childPath = frame.path + '[' + key + ']';
       }
-      result.bytes += 1;
+      result.bytes = satishAdd(result.bytes, 1);
       noteBytes(frame.path);
       stack.push({ value: child, enclosingDepth: frame.containerDepth, path: childPath, entered: false, keys: null, index: 0, containerDepth: 0, isObject: false });
       continue;
@@ -179,7 +249,7 @@ function inspectJsonValue(root, policy, path) {
     active.delete(frame.value);
     stack.pop();
   }
-  if (result.bytes > policy.maxVariablesBytes) {
+  if (!terminated && result.bytes > policy.maxVariablesBytes) {
     addViolation({ code: GQLCAGE_ERROR_CODES.VARIABLES_TOO_LARGE, message: 'JSON value encoded size exceeds policy', path, details: { bytes: result.bytes, limit: policy.maxVariablesBytes } });
   }
   return result;
@@ -257,6 +327,7 @@ export function auditGraphQLRequest(payload, options = {}) {
     }
   }
 
+  let payloadInvalid = false;
   if (!byteLimitHit && data !== null && (typeof data === 'object' || Array.isArray(data))) {
     const payloadScanPolicy = { ...policy, maxVariablesBytes: policy.maxBytes, maxVariablesDepth: Number.MAX_SAFE_INTEGER, maxVariablesNodes: Number.MAX_SAFE_INTEGER };
     const payloadScan = inspectJsonValue(data, payloadScanPolicy, 'payload');
@@ -265,114 +336,119 @@ export function auditGraphQLRequest(payload, options = {}) {
       sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_TOO_LARGE, 'GraphQL request payload exceeds the configured byte limit', {
         details: { bytes: payloadScan.bytes, limit: policy.maxBytes }
       }));
+      payloadInvalid = true;
     }
     for (const violation of payloadScan.violations) {
-      if (violation.code === GQLCAGE_ERROR_CODES.VARIABLES_CYCLE || violation.code === GQLCAGE_ERROR_CODES.PROTOTYPE_POLLUTION) {
+      payloadInvalid = true;
+      if (violation.code !== GQLCAGE_ERROR_CODES.VARIABLES_TOO_LARGE) {
         addUniqueFinding(makeFinding(violation.code, violation.message, { path: violation.path, details: violation.details }));
       }
     }
   }
 
-  if (data === null && sink.findings.length === 0) {
-    sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'GraphQL request payload must be an object or a non-empty batch array', { path: 'payload' }));
-  }
-  if (Array.isArray(data) && data.length === 0) {
-    sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'GraphQL request batch array cannot be empty', { path: 'payload' }));
-  }
-  const entries = Array.isArray(data) ? data : data === null ? [] : [data];
-  metrics.batchSize = Array.isArray(data) ? data.length : entries.length;
-  if (Array.isArray(data) && data.length > policy.maxBatchSize) {
-    sink.add(makeFinding(GQLCAGE_ERROR_CODES.BATCH_SIZE_EXCEEDED, 'GraphQL request batch size exceeds policy', {
-      details: { value: data.length, limit: policy.maxBatchSize }
-    }));
-  }
-
-  const auditCount = Math.min(entries.length, policy.maxBatchSize);
-  for (let index = 0; index < auditCount; index += 1) {
-    const entry = entries[index];
-    const entryPath = Array.isArray(data) ? 'entry[' + index + ']' : 'entry';
-    if (!isPlainJsonObject(entry)) {
-      sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'GraphQL request entry must be a plain JSON object', { path: entryPath }));
-      continue;
+  if (!payloadInvalid) {
+    if (data === null && sink.findings.length === 0) {
+      sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'GraphQL request payload must be an object or a non-empty batch array', { path: 'payload' }));
     }
-    for (const key of Object.keys(entry)) {
-      if (!REQUEST_KEYS.has(key)) {
-        sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'GraphQL request entry contains an unknown key', {
-          path: entryPath,
-          details: { key }
+    if (Array.isArray(data) && data.length === 0) {
+      sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'GraphQL request batch array cannot be empty', { path: 'payload' }));
+    }
+    const entries = Array.isArray(data) ? data : data === null ? [] : [data];
+    metrics.batchSize = Array.isArray(data) ? data.length : entries.length;
+    if (Array.isArray(data) && data.length > policy.maxBatchSize) {
+      sink.add(makeFinding(GQLCAGE_ERROR_CODES.BATCH_SIZE_EXCEEDED, 'GraphQL request batch size exceeds policy', {
+        details: { value: data.length, limit: policy.maxBatchSize }
+      }));
+    }
+
+    const auditCount = Math.min(entries.length, policy.maxBatchSize);
+    for (let index = 0; index < auditCount; index += 1) {
+      const entry = entries[index];
+      const entryPath = Array.isArray(data) ? 'entry[' + index + ']' : 'entry';
+      if (!isPlainJsonObject(entry)) {
+        sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'GraphQL request entry must be a plain JSON object', { path: entryPath }));
+        continue;
+      }
+      for (const key of Object.keys(entry)) {
+        if (!REQUEST_KEYS.has(key)) {
+          sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'GraphQL request entry contains an unknown key', {
+            path: entryPath,
+            details: { key }
+          }));
+        }
+      }
+      if (entry.operationName !== undefined && entry.operationName !== null && typeof entry.operationName !== 'string') {
+        sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'operationName must be a string or null', { path: entryPath + '.operationName' }));
+      }
+      if (typeof entry.operationName === 'string' && entry.operationName.length > policy.maxStringLength) {
+        sink.add(makeFinding(GQLCAGE_ERROR_CODES.STRING_LENGTH_EXCEEDED, 'operationName length exceeds policy', {
+          path: entryPath + '.operationName',
+          details: { value: entry.operationName.length, limit: policy.maxStringLength }
         }));
       }
-    }
-    if (entry.operationName !== undefined && entry.operationName !== null && typeof entry.operationName !== 'string') {
-      sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'operationName must be a string or null', { path: entryPath + '.operationName' }));
-    }
-    if (typeof entry.operationName === 'string' && entry.operationName.length > policy.maxStringLength) {
-      sink.add(makeFinding(GQLCAGE_ERROR_CODES.STRING_LENGTH_EXCEEDED, 'operationName length exceeds policy', {
-        path: entryPath + '.operationName',
-        details: { value: entry.operationName.length, limit: policy.maxStringLength }
-      }));
-    }
-    const variableBytesBefore = metrics.variablesBytes;
-    const variableNodesBefore = metrics.variablesNodes;
-    if (entry.variables !== undefined && entry.variables !== null && !isPlainJsonObject(entry.variables)) {
-      sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'variables must be a JSON object or null', { path: entryPath + '.variables' }));
-    }
-    if (entry.extensions !== undefined && entry.extensions !== null && !isPlainJsonObject(entry.extensions)) {
-      sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'extensions must be a JSON object or null', { path: entryPath + '.extensions' }));
-    }
-    if (entry.variables !== undefined && entry.variables !== null) {
-      const scan = inspectJsonValue(entry.variables, policy, entryPath + '.variables');
-      mergeJsonScan(metrics, scan);
-      for (const violation of scan.violations) {
-        addUniqueFinding(makeFinding(violation.code, violation.message, { path: violation.path, details: violation.details }));
+      const variableBytesBefore = metrics.variablesBytes;
+      const variableNodesBefore = metrics.variablesNodes;
+      if (entry.variables !== undefined && entry.variables !== null && !isPlainJsonObject(entry.variables)) {
+        sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'variables must be a JSON object or null', { path: entryPath + '.variables' }));
       }
-    }
-    if (entry.extensions !== undefined && entry.extensions !== null) {
-      const scan = inspectJsonValue(entry.extensions, policy, entryPath + '.extensions');
-      mergeJsonScan(metrics, scan);
-      for (const violation of scan.violations) {
-        addUniqueFinding(makeFinding(violation.code, violation.message, { path: violation.path, details: violation.details }));
+      if (entry.extensions !== undefined && entry.extensions !== null && !isPlainJsonObject(entry.extensions)) {
+        sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'extensions must be a JSON object or null', { path: entryPath + '.extensions' }));
       }
-    }
-    if (metrics.variablesBytes - variableBytesBefore > policy.maxVariablesBytes) {
-      sink.add(makeFinding(GQLCAGE_ERROR_CODES.VARIABLES_TOO_LARGE, 'combined variables and extensions encoded size exceeds policy', {
-        path: entryPath,
-        details: { bytes: metrics.variablesBytes - variableBytesBefore, limit: policy.maxVariablesBytes }
-      }));
-    }
-    if (metrics.variablesNodes - variableNodesBefore > policy.maxVariablesNodes) {
-      sink.add(makeFinding(GQLCAGE_ERROR_CODES.VARIABLES_TOO_LARGE, 'combined variables and extensions node count exceeds policy', {
-        path: entryPath,
-        details: { nodes: metrics.variablesNodes - variableNodesBefore, limit: policy.maxVariablesNodes }
-      }));
-    }
-    if (typeof entry.query !== 'string' || entry.query.length === 0) {
-      sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'GraphQL request entry requires a non-empty query string', { path: entryPath + '.query' }));
-      continue;
+      if (entry.variables !== undefined && entry.variables !== null) {
+        const scan = inspectJsonValue(entry.variables, policy, entryPath + '.variables');
+        mergeJsonScan(metrics, scan);
+        for (const violation of scan.violations) {
+          addUniqueFinding(makeFinding(violation.code, violation.message, { path: violation.path, details: violation.details }));
+        }
+      }
+      if (entry.extensions !== undefined && entry.extensions !== null) {
+        const scan = inspectJsonValue(entry.extensions, policy, entryPath + '.extensions');
+        mergeJsonScan(metrics, scan);
+        for (const violation of scan.violations) {
+          addUniqueFinding(makeFinding(violation.code, violation.message, { path: violation.path, details: violation.details }));
+        }
+      }
+      if (metrics.variablesBytes - variableBytesBefore > policy.maxVariablesBytes) {
+        sink.add(makeFinding(GQLCAGE_ERROR_CODES.VARIABLES_TOO_LARGE, 'combined variables and extensions encoded size exceeds policy', {
+          path: entryPath,
+          details: { bytes: metrics.variablesBytes - variableBytesBefore, limit: policy.maxVariablesBytes }
+        }));
+      }
+      if (metrics.variablesNodes - variableNodesBefore > policy.maxVariablesNodes) {
+        sink.add(makeFinding(GQLCAGE_ERROR_CODES.VARIABLES_TOO_LARGE, 'combined variables and extensions node count exceeds policy', {
+          path: entryPath,
+          details: { nodes: metrics.variablesNodes - variableNodesBefore, limit: policy.maxVariablesNodes }
+        }));
+      }
+      if (typeof entry.query !== 'string' || entry.query.length === 0) {
+        sink.add(makeFinding(GQLCAGE_ERROR_CODES.REQUEST_SHAPE_INVALID, 'GraphQL request entry requires a non-empty query string', { path: entryPath + '.query' }));
+        continue;
+      }
+
+      const report = auditGraphQL(entry.query, policy);
+      metrics.queries += 1;
+      if (report.metrics.depth > metrics.depth) metrics.depth = report.metrics.depth;
+      if (report.metrics.expandedFields > metrics.expandedFields) metrics.expandedFields = report.metrics.expandedFields;
+      if (report.metrics.aliases > metrics.aliases) metrics.aliases = report.metrics.aliases;
+      if (report.metrics.directives > metrics.directives) metrics.directives = report.metrics.directives;
+      if (report.metrics.complexity > metrics.complexity) metrics.complexity = report.metrics.complexity;
+      metrics.tokens = satishAdd(metrics.tokens, report.metrics.tokens);
+      metrics.operations = satishAdd(metrics.operations, report.metrics.operations);
+      metrics.fragments = satishAdd(metrics.fragments, report.metrics.fragments);
+      for (const finding of report.findings) sink.add(copyFindingWithPath(finding, entryPath + '.query'));
+      results.push({
+        index,
+        safe: report.safe,
+        depth: report.metrics.depth,
+        expandedFields: report.metrics.expandedFields,
+        aliases: report.metrics.aliases,
+        directives: report.metrics.directives,
+        complexity: report.metrics.complexity,
+        operations: report.metrics.operations,
+        fragments: report.metrics.fragments
+      });
     }
 
-    const report = auditGraphQL(entry.query, policy);
-    metrics.queries += 1;
-    if (report.metrics.depth > metrics.depth) metrics.depth = report.metrics.depth;
-    if (report.metrics.expandedFields > metrics.expandedFields) metrics.expandedFields = report.metrics.expandedFields;
-    if (report.metrics.aliases > metrics.aliases) metrics.aliases = report.metrics.aliases;
-    if (report.metrics.directives > metrics.directives) metrics.directives = report.metrics.directives;
-    if (report.metrics.complexity > metrics.complexity) metrics.complexity = report.metrics.complexity;
-    metrics.tokens = satishAdd(metrics.tokens, report.metrics.tokens);
-    metrics.operations = satishAdd(metrics.operations, report.metrics.operations);
-    metrics.fragments = satishAdd(metrics.fragments, report.metrics.fragments);
-    for (const finding of report.findings) sink.add(copyFindingWithPath(finding, entryPath + '.query'));
-    results.push({
-      index,
-      safe: report.safe,
-      depth: report.metrics.depth,
-      expandedFields: report.metrics.expandedFields,
-      aliases: report.metrics.aliases,
-      directives: report.metrics.directives,
-      complexity: report.metrics.complexity,
-      operations: report.metrics.operations,
-      fragments: report.metrics.fragments
-    });
   }
 
   return {
